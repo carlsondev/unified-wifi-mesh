@@ -28,7 +28,6 @@
 #include <functional>
 #include <vector>
 
-#define EC_FRAME_BASE_SIZE (offsetof(ec_frame_t, attributes))
 
 class ec_session_t {
     mac_address_t   m_enrollee_mac;
@@ -37,6 +36,12 @@ class ec_session_t {
     ec_params_t    m_params; 
     wifi_activation_status_t    m_activation_status;
     ec_data_t   m_data;
+
+    /*
+        Map from Chirp Hash or C-sign-key hash to DPP (Reconfiguration) Authentication Request
+    */
+    std::map<std::string, std::vector<uint8_t>> m_frame_map;
+
 
     /**
      * @brief Send a chirp notification to the peer
@@ -111,23 +116,32 @@ public:
      */
     std::pair<uint8_t*, uint16_t> create_auth_request();
 
-    /**
-     * @brief Handle a chirp notification TLV and output the authentication request frame (if necessary)
-     * 
-     * @param chirp_tlv The chirp TLV to parse and handle
-     * @param out_frame The buffer to store the output frame (NULL if no frame is needed)
-     * @return int 0 if successful, -1 otherwise
-     */
-    int handle_chirp_notification(em_dpp_chirp_value_t* chirp_tlv, uint8_t **out_frame);
+    /*
+    * @brief Create an reconfiguration presence announcement`ec_frame_t` with the necessary attributes 
+    * 
+    * @return std::pair<uint8_t*, uint16_t> The buffer containing the `ec_frame_t` and the length of the frame
+    */
+   std::pair<uint8_t*, uint16_t> create_recfg_auth_req();
 
     /**
-     * @brief Handle a proxied encapsulated DPP TLV and output the correct frame to send (if necessary)
+     * @brief Handle a chirp notification msg tlv and send the next message
      * 
-     * @param encap_tlv The 1905 Encap DPP TLV to parse and handle
-     * @param out_frame The buffer to store the output frame (NULL if no frame is needed)
+     * @param chirp_tlv The chirp TLV to parse and handle
+     * @param tlv_len The length of the chirp TLV
      * @return int 0 if successful, -1 otherwise
      */
-    int handle_proxy_encap_dpp_tlv(em_encap_dpp_t *encap_tlv, uint8_t **out_frame);
+    int handle_chirp_notification(em_dpp_chirp_value_t* chirp_tlv, uint16_t tlv_len);
+
+    /**
+     * @brief Handle a proxied encapsulated DPP message TLVs (including chirp value) and send the next message
+     * 
+     * @param encap_tlv The 1905 Encap DPP TLV to parse and handle
+     * @param encap_tlv_len The length of the 1905 Encap DPP TLV
+     * @param chirp_tlv The DPP Chirp Value TLV to parse and handle (NULL if not present)
+     * @param chirp_tlv_len The length of the DPP Chirp Value TLV (0 if not present)
+     * @return int 0 if successful, -1 otherwise
+     */
+    int handle_proxy_encap_dpp_msg(em_encap_dpp_t *encap_tlv, uint16_t encap_tlv_len, em_dpp_chirp_value_t *chirp_tlv, uint16_t chirp_tlv_len);
     
     /**
      * @brief Create an authentication response frame in a pre-allocated buffer

@@ -22,6 +22,9 @@
 #include <map>
 #include <string>
 
+
+#define EC_FRAME_BASE_SIZE (offsetof(ec_frame_t, attributes))
+
 namespace easyconnect {
 
  static const std::map<ec_status_code_t, std::string> status_code_map = {
@@ -107,6 +110,18 @@ public:
     }
 
     /**
+     * @brief Copy (overrride) attributes to a frame
+     * 
+     * @param frame The frame to copy the attributes to
+     * @param attrs The attributes to copy
+     * @param attrs_len The length of the attributes
+     * @return ec_frame_t* The frame with the copied attributes (returned due to realloc)
+     * 
+     * @warning The frame must be freed by the caller
+     */
+    static ec_frame_t* copy_attrs_to_frame(ec_frame_t *frame, uint8_t *attrs, uint16_t attrs_len);
+
+    /**
      * @brief Validate an EC frame based on the WFA parameters
      * 
      * @param frame The frame to validate
@@ -135,6 +150,46 @@ public:
      */
     static uint16_t freq_to_channel_attr(unsigned int freq);
 
+    /**
+     * @brief Parse a DPP Chirp TLV
+     * 
+     * @param buff [in] The buffer containing the chirp TLV
+     * @param chirp_tlv_len [in] The length of the chirp TLV
+     * @param mac [out] The MAC address to store in the chirp TLV
+     * @param hash [out] The hash to store in the chirp TLV
+     * @param hash_len [out] The length of the hash
+     * @return int 0 if successful, -1 otherwise
+     */
+    static int parse_dpp_chirp_tlv(em_dpp_chirp_value_t* chirp_tlv,  uint16_t chirp_tlv_len, mac_addr_t *mac, uint8_t **hash, uint8_t *hash_len);
+
+    /**
+     * @brief Parse an Encap DPP TLV
+     * 
+     * @param encap_tlv [in] The buffer containing the Encap DPP TLV
+     * @param encap_tlv_len [in] The length of the Encap DPP TLV
+     * @param dest_mac [out] The destination MAC address (0 if not present)
+     * @param frame_type [out] The frame type
+     * @param encap_frame [out] The encapsulated frame
+     * @param encap_frame_len [out] The length of the encapsulated frame
+     * @return int 0 if successful, -1 otherwise
+     */
+    static int parse_encap_dpp_tlv(em_encap_dpp_t* encap_tlv,  uint16_t encap_tlv_len, mac_addr_t *dest_mac, uint8_t *frame_type, uint8_t** encap_frame, uint8_t *encap_frame_len);
+
+    /**
+     * @brief Creates and allocates an Encap DPP TLV
+     * 
+     * @param dpp_frame_indicator [in] The DPP frame indicator (0 = DPP Public Action frame, 1 = GAS Frame)
+     * @param content_type [in] The content type
+     * @param dest_mac [in] The destination MAC address (0 if not present)
+     * @param frame_type [in] The frame type
+     * @param encap_frame [in] The encapsulated frame
+     * @param encap_frame_len [in] The length of the encapsulated frame
+     * @return em_encap_dpp_t* The heap allocated Encap DPP TLV, NULL if failed 
+     */
+    static em_encap_dpp_t * create_encap_dpp_tlv(bool dpp_frame_indicator, uint8_t content_type, 
+        mac_addr_t *dest_mac, uint8_t frame_type, uint8_t *encap_frame, uint8_t encap_frame_len);
+
+    static std::string hash_to_hex_string(const uint8_t *hash, size_t hash_len);
     static void print_bignum (BIGNUM *bn);
     static void print_ec_point (const EC_GROUP *group, BN_CTX *bnctx, EC_POINT *point);
 
