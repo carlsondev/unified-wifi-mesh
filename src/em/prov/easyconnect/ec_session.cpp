@@ -107,20 +107,16 @@ std::pair<uint8_t*, uint16_t> ec_session_t::create_auth_request()
         return std::make_pair(wrap_attribs, wrapped_len);
     });
 
-    // Add attributes to the frame
-    uint16_t new_len = EC_FRAME_BASE_SIZE + attrib_len;
-    buff = (uint8_t*) realloc(buff, new_len);
-    if (buff == NULL) {
+    if (!(frame = ec_util::copy_attrs_to_frame(frame, attribs, attrib_len))) {
         m_activation_status = ActStatus_Failed;
-        printf("%s:%d unable to realloc memory\n", __func__, __LINE__);
+        printf("%s:%d unable to copy attributes to frame\n", __func__, __LINE__);
+        free(attribs);
         return std::make_pair<uint8_t*, uint16_t>(NULL, 0);
     }
-    frame = (ec_frame_t *)buff;
-    memcpy(frame->attributes, attribs, attrib_len);
 
     free(attribs);
 
-    return std::make_pair(buff, new_len);
+    return std::make_pair((uint8_t*)frame, EC_FRAME_BASE_SIZE + attrib_len);
 
 }
 
@@ -152,9 +148,48 @@ int ec_session_t::create_pres_ann(uint8_t *buff)
     uint16_t attrib_len = 0;
 
     attribs = ec_util::add_attrib(attribs, &attrib_len, ec_attrib_id_resp_bootstrap_key_hash, SHA256_DIGEST_LENGTH, resp_boot_key_chirp_hash);
-    attrib_len += ec_util::get_ec_attr_size(SHA256_DIGEST_LENGTH); 
 
     return attrib_len;
+}
+
+std::pair<uint8_t *, uint16_t> ec_session_t::create_recfg_auth_req()
+{
+
+    uint8_t* buff = (uint8_t*) calloc(EC_FRAME_BASE_SIZE, 1);
+
+    ec_frame_t    *frame = (ec_frame_t *)buff;
+    frame->frame_type = ec_frame_type_presence_announcement; 
+
+    // Compute the hash of the responder boot key 
+    uint8_t resp_boot_key_chirp_hash[SHA512_DIGEST_LENGTH];
+    if (compute_key_hash(m_data.responder_boot_key, resp_boot_key_chirp_hash, "chirp") < 1) {
+        m_activation_status = ActStatus_Failed;
+        printf("%s:%d unable to compute \"chirp\" responder bootstrapping key hash\n", __func__, __LINE__);
+        return std::make_pair<uint8_t*, uint16_t>(NULL, 0);
+    }
+
+    uint8_t* attribs = NULL;
+    uint16_t attrib_len = 0;
+
+    // TODO: Add the transaction ID, connector
+    uint8_t trans_id = 0;
+    char json_connector[] = "connector";
+
+    attribs = ec_util::add_attrib(attribs, &attrib_len, ec_attrib_id_trans_id, trans_id);
+    attribs = ec_util::add_attrib(attribs, &attrib_len, ec_attrib_id_proto_version, (uint8_t)m_data.version);
+    attribs = ec_util::add_attrib(attribs, &attrib_len, ec_attrib_id_dpp_connector, strlen(json_connector), (uint8_t*)json_connector);
+    attribs = ec_util::add_attrib(attribs, &attrib_len, ec_attrib_id_config_nonce, m_params.noncelen, m_params.responder_nonce); //TODO: Revisit this
+
+
+    if (!(frame = ec_util::copy_attrs_to_frame(frame, attribs, attrib_len))) {
+        m_activation_status = ActStatus_Failed;
+        printf("%s:%d unable to copy attributes to frame\n", __func__, __LINE__);
+        free(attribs);
+        return std::make_pair<uint8_t*, uint16_t>(NULL, 0);
+    }
+    free(attribs);
+
+    return std::make_pair((uint8_t*)frame, EC_FRAME_BASE_SIZE + attrib_len);
 }
 
 int ec_session_t::handle_pres_ann(uint8_t *buff, unsigned int len)
@@ -338,32 +373,18 @@ int ec_session_t::init_session(ec_data_t* ec_data)
 
 }
 
-int ec_session_t::handle_chirp_notification(em_dpp_chirp_value_t *chirp_tlv, uint8_t **out_frame)
+int ec_session_t::handle_chirp_notification(em_dpp_chirp_value_t *chirp_tlv, uint16_t tlv_len)
 {
     // TODO: Currently only handling controller side
 
-    // Parse TLV
-    bool mac_addr_present = chirp_tlv->mac_present;
-    bool hash_valid = chirp_tlv->hash_valid;
-
-    uint8_t *data_ptr = chirp_tlv->data;
     mac_addr_t mac = {0};
-    if (mac_addr_present) {
-        memcpy(mac, data_ptr, sizeof(mac_addr_t));
-        data_ptr += sizeof(mac_addr_t);
-    }
-
-    if (!hash_valid) {
-        // Clear (Re)configuration state, agent side
-        return 0;
-    }
-
     uint8_t hash[255] = {0}; // Max hash length to avoid dynamic allocation
     uint8_t hash_len = 0;
 
-    hash_len = *data_ptr;
-    data_ptr++;
-    memcpy(hash, data_ptr, hash_len);
+    if (ec_util::parse_dpp_chirp_tlv(chirp_tlv, tlv_len, &mac, (uint8_t**)&hash, &hash_len) < 0) {
+        printf("%s:%d: Failed to parse DPP Chirp TLV\n", __func__, __LINE__);
+        return -1;
+    }
 
     // Validate hash
     // Compute the hash of the responder boot key 
@@ -376,7 +397,6 @@ int ec_session_t::handle_chirp_notification(em_dpp_chirp_value_t *chirp_tlv, uin
 
     if (memcmp(hash, resp_boot_key_chirp_hash, hash_len) != 0) {
         // Hashes don't match, don't initiate DPP authentication
-        *out_frame = NULL;
         printf("%s:%d: Chirp notification hash and DPP URI hash did not match! Stopping DPP!\n", __func__, __LINE__);
         return -1;
     }
@@ -388,18 +408,11 @@ int ec_session_t::handle_chirp_notification(em_dpp_chirp_value_t *chirp_tlv, uin
     }
 
     // Create Auth Request Encap TLV: EasyMesh 5.3.4
-    em_encap_dpp_t* encap_dpp_tlv = (em_encap_dpp_t*)calloc(sizeof(em_encap_dpp_t) + auth_frame_len , 1);
+    em_encap_dpp_t* encap_dpp_tlv = ec_util::create_encap_dpp_tlv(0, 0, &mac, 0, auth_frame, auth_frame_len);
     if (encap_dpp_tlv == NULL) {
-        printf("%s:%d: Failed to allocate memory for Encap DPP TLV\n", __func__, __LINE__);
+        printf("%s:%d: Failed to create Encap DPP TLV\n", __func__, __LINE__);
         return -1;
     }
-    encap_dpp_tlv->dpp_frame_indicator = 0;
-    encap_dpp_tlv->frame_type = 0; // DPP Authentication Request Frame
-    encap_dpp_tlv->enrollee_mac_addr_present = 1;
-
-    memcpy(encap_dpp_tlv->dest_mac_addr, mac, sizeof(mac_addr_t));
-    encap_dpp_tlv->encap_frame_len = auth_frame_len;
-    memcpy(encap_dpp_tlv->encap_frame, auth_frame, auth_frame_len);
 
     free(auth_frame);
 
@@ -433,7 +446,78 @@ int ec_session_t::handle_chirp_notification(em_dpp_chirp_value_t *chirp_tlv, uin
 
 }
 
-int ec_session_t::handle_proxy_encap_dpp_tlv(em_encap_dpp_t *encap_tlv, uint8_t **out_frame) {
+int ec_session_t::handle_proxy_encap_dpp_msg(em_encap_dpp_t *encap_tlv, uint16_t encap_tlv_len, em_dpp_chirp_value_t *chirp_tlv, uint16_t chirp_tlv_len)
+{
+
+    if (encap_tlv == NULL || encap_tlv_len == 0) {
+        printf("%s:%d: Encap DPP TLV is empty\n", __func__, __LINE__);
+        return -1;
+    }
+
+    
+    mac_addr_t dest_mac = {0};
+    uint8_t frame_type = 0;
+    uint8_t* encap_frame = NULL;
+    uint8_t encap_frame_len = 0;
+
+    if (ec_util::parse_encap_dpp_tlv(encap_tlv, encap_tlv_len, &dest_mac, &frame_type, &encap_frame, &encap_frame_len) < 0) {
+        printf("%s:%d: Failed to parse Encap DPP TLV\n", __func__, __LINE__);
+        return -1;
+    }
+
+    mac_addr_t chirp_mac = {0};
+    uint8_t chirp_hash[255] = {0}; // Max hash length to avoid dynamic allocation
+    uint8_t chirp_hash_len = 0;
+
+    ec_frame_type_t ec_frame_type = (ec_frame_type_t)frame_type;
+    switch (ec_frame_type) {
+        case ec_frame_type_auth_req: {
+            if (chirp_tlv == NULL || chirp_tlv_len == 0) {
+                printf("%s:%d: Chirp TLV is empty\n", __func__, __LINE__);
+                return -1;
+            }
+            if (ec_util::parse_dpp_chirp_tlv(chirp_tlv, chirp_tlv_len, &chirp_mac, (uint8_t**)&chirp_hash, &chirp_hash_len) < 0) {
+                printf("%s:%d: Failed to parse DPP Chirp TLV\n", __func__, __LINE__);
+                return -1;
+            }
+            std::string chirp_hash_str = ec_util::hash_to_hex_string(chirp_hash, chirp_hash_len);
+            printf("%s:%d: Chirp TLV Hash: %s\n", __func__, __LINE__, chirp_hash_str.c_str());
+            
+            // Store the encap frame keyed by the chirp hash in the map
+            std::vector<uint8_t> encap_frame_vec(encap_frame, encap_frame + encap_frame_len);
+            m_frame_map[chirp_hash_str] = encap_frame_vec;
+            break;
+        }
+        case ec_frame_type_recfg_auth_req: {
+            printf("%s:%d: Encap DPP frame type (%d) not handled\n", __func__, __LINE__, ec_frame_type);
+            // TODO: Handle reconfiguration authentication request when C-sign key is set
+            //std::string csign_key_str = ec_util::hash_to_hex_string(hash, hash_len);
+            // printf("%s:%d: C Sign Key Hash: %s\n", __func__, __LINE__, csign_key_str.c_str());
+            
+            // // Store the encap frame keyed by the chirp hash in the map
+            // std::vector<uint8_t> encap_frame_vec(encap_frame, encap_frame + encap_frame_len);
+            // m_frame_map[csign_key_str] = encap_frame_vec; 
+            break;
+        }
+        case ec_frame_type_recfg_announcement: {
+            break;
+        }
+        case ec_frame_type_auth_rsp:
+        case ec_frame_type_recfg_auth_rsp: {
+            break;
+        }
+        case ec_frame_type_auth_cnf:
+        case ec_frame_type_recfg_auth_cnf: {
+            break;
+        }
+            
+        default:
+            printf("%s:%d: Encap DPP frame type (%d) not handled\n", __func__, __LINE__, ec_frame_type);
+            break;
+    }
+    // Parse out dest STA mac address and hash value then validate against the hash in the 
+    // ec_session dpp uri info public key. 
+    // Then construct an Auth request frame and send back in an Encap message
 
 }
 
