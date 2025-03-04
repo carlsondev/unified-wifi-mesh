@@ -38,9 +38,14 @@ class ec_session_t {
     ec_data_t   m_data;
 
     /*
-        Map from Chirp Hash or C-sign-key hash to DPP (Reconfiguration) Authentication Request
-    */
-    std::map<std::string, std::vector<uint8_t>> m_frame_map;
+     * Map from Chirp Hash to DPP Authentication Request
+     */
+    std::map<std::string, std::vector<uint8_t>> m_chirp_hash_frame_map;
+    /*
+     * Vector of all cached DPP Reconfiguration Authentication Requests.
+     * Hash does not matter since it is compared against the Controllers C-sign key
+     */
+    std::vector<std::vector<uint8_t>> m_stored_recfg_auth_frames;
 
 
     /**
@@ -82,8 +87,44 @@ class ec_session_t {
      */
     int handle_pres_ann(uint8_t *buff, unsigned int len);
 
+    /**
+     * @brief Handle a authentication request frame
+     * 
+     * @param buff The frame to handle
+     * @param len The length of the frame
+     * @return int 0 if successful, -1 otherwise
+     */
+    int handle_auth_req(uint8_t *buff, unsigned int len);
 
+
+    /**
+     * @brief Compute intermediate key (k1 or k2)
+     * 
+     * @param is_first If true, compute k1; if false, compute k2
+     * @return 0 on success, -1 on failure
+     */
     int compute_intermediate_key(bool is_first);
+
+    int compute_ke(uint8_t *ke_buffer);
+
+    /**
+     * @brief Called when recieving a Authentication Request,
+     *         this function checks that the "Responder" (self) is capable of 
+     *         supporting the role indicated by the Initiator's capabilities.
+     * 
+     */
+    bool check_supports_init_caps(ec_dpp_capabilities_t caps);
+
+    /**
+     * Calculates L = ((b_R + p_R) modulo q) * B_I then gets the x-coordinate of the result
+     * 
+     * @param group The EC_GROUP representing the elliptic curve
+     * @param bR Private Responder Bootstrapping Key
+     * @param pR Private Responder Protocol Key
+     * @param BI Public Initiator Bootstrapping Key
+     * @return EC_POINT* The calculated L point X value, or NULL on failure. Caller must free with BN_free()
+     */
+    BIGNUM* calculate_Lx(const BIGNUM* bR, const BIGNUM* pR, const EC_POINT* BI);
 
     /**
      * @brief Add a wrapped data attribute to a frame
@@ -96,15 +137,70 @@ class ec_session_t {
      * @param create_wrap_attribs A function to create the attributes to wrap and their length. Memory is handled by function (see note)
      * @return uint8_t* The new frame attributes with the wrapped data attribute added
      * 
-     * @note The `create_wrap_attribs` function will allocate heap-memory which is freed inside the `add_wrapped_data_attr` function.
+     * @warning The `create_wrap_attribs` function will allocate heap-memory which is freed inside the `add_wrapped_data_attr` function.
      *     **The caller should not use statically allocated memory in `create_wrap_attribs` or free the memory returned by `create_wrap_attribs`.**
      */
     uint8_t* add_wrapped_data_attr(ec_frame_t *frame, uint8_t* frame_attribs, uint16_t* non_wrapped_len, 
         bool use_aad, uint8_t* key, std::function<std::pair<uint8_t*, uint16_t>()> create_wrap_attribs);
-    
+   
+
+    /**
+     * @brief Unwrap a wrapped data attribute
+     * 
+     * @param wrapped_attrib The wrapped attribute to unwrap (retreieved using `get_attribute`)
+     * @param frame The frame to use as AAD. Can be NULL if no AAD is needed
+     * @param uses_aad Whether the wrapped attribute uses AAD
+     * @param key The key to use for decryption
+     * @return std::pair<uint8_t*, size_t> A heap allocated buffer of unwrapped attributes on success which can then be fetched via `get_attribute`,
+     *         along with the length of that buffer. The buffer is NULL and the size is 0 on failure.
+     * 
+     * @warning The caller is responsible for freeing the memory returned by this function
+     */
+    std::pair<uint8_t*, size_t> unwrap_wrapped_attrib(ec_attribute_t* wrapped_attrib, ec_frame_t *frame, bool uses_aad, uint8_t* key);
+        
+    /**
+     * @brief Implements the HMAC-based Key Derivation Function (HKDF) as specified in RFC 5869
+     *
+     * This implementation allows skipping the extract phase if pre-extracted input is provided.
+     *
+     * @param h         Pointer to the EVP_MD digest to use for HMAC operations (e.g., EVP_sha256())
+     * @param skip      If non-zero, skips the extract phase and treats ikm as the prk directly
+     * @param ikm       Pointer to the input keying material
+     * @param ikmlen    Length of the input keying material in bytes
+     * @param salt      Pointer to the optional salt value (can be NULL). In the spec, a null salt is represented as "<>".
+     * @param saltlen   Length of the salt in bytes (can be 0)
+     * @param info      Pointer to the optional context and application specific information (can be NULL)
+     * @param infolen   Length of the info in bytes (can be 0)
+     * @param okm       Pointer to the buffer for storing the output keying material (must be pre-allocated)
+     * @param okmlen    Length of the output keying material to be generated in bytes
+     *
+     * @return The length of the output keying material in bytes on success, 0 on failure
+     */
     int hkdf(const EVP_MD *h, int skip, uint8_t *ikm, int ikmlen, 
             uint8_t *salt, int saltlen, uint8_t *info, int infolen, 
             uint8_t *okm, int okmlen);
+
+
+    /**
+     * @brief Abstracted HKDF computation that handles both simple and complex inputs
+     * 
+     * This function provides a unified interface for HKDF computations, handling both
+     * simple single-input operations and more complex operations with multiple inputs.
+     * It properly formats BIGNUMs with appropriate padding based on prime length.
+     *
+     * @param key_out Buffer to store the output key (must be pre-allocated)
+     * @param key_out_len Length of the output key
+     * @param info_str Information string for HKDF
+     * @param bn_inputs Array of BIGNUMs to use as IKM
+     * @param bn_count Number of BIGNUMs in the array
+     * @param raw_salt Raw salt buffer (can be NULL)
+     * @param raw_salt_len Length of raw salt buffer
+     * 
+     * @return Length of the output key on success, 0 on failure
+     */
+    int compute_hkdf_key(uint8_t *key_out, int key_out_len, const char *info_str,
+        const BIGNUM **x_val_inputs, int x_val_count, 
+        uint8_t *raw_salt, int raw_salt_len);
 
 public:
     int init_session(ec_data_t* ec_data);
@@ -113,15 +209,54 @@ public:
      * @brief Create an authentication request `ec_frame_t` with the necessary attributes 
      * 
      * @return std::pair<uint8_t*, uint16_t> The buffer containing the `ec_frame_t` and the length of the frame
+     * 
+     * @warning The caller is responsible for freeing the memory returned by this function
      */
     std::pair<uint8_t*, uint16_t> create_auth_request();
 
+    /**
+     * @brief Create an authentication response `ec_frame_t` with the necessary attributes 
+     * 
+     * @return std::pair<uint8_t*, uint16_t> The buffer containing the `ec_frame_t` and the length of the frame
+     * 
+     * @warning The caller is responsible for freeing the memory returned by this function
+     */
+    std::pair<uint8_t*, uint16_t> create_auth_resp(ec_status_code_t dpp_status);
+
     /*
-    * @brief Create an reconfiguration presence announcement`ec_frame_t` with the necessary attributes 
+    * @brief Create an reconfiguration presence announcement `ec_frame_t` with the necessary attributes 
     * 
     * @return std::pair<uint8_t*, uint16_t> The buffer containing the `ec_frame_t` and the length of the frame
+    * 
+    * @warning The caller is responsible for freeing the memory returned by this function
     */
    std::pair<uint8_t*, uint16_t> create_recfg_auth_req();
+
+    /**
+     * @brief Create an authentication confirm frame `ec_frame_t` with the necessary attributes
+     * 
+     * @return std::pair<uint8_t*, uint16_t> The buffer containing the `ec_frame_t` and the length of the frame
+     * 
+     * @warning The caller is responsible for freeing the memory returned by this function
+     */
+    std::pair<uint8_t *, uint16_t> create_auth_cnf();
+
+    /**
+     * @brief Create a reconfiguration authentication confirm frame `ec_frame_t` with the necessary attributes
+     * 
+     * @return std::pair<uint8_t*, uint16_t> The buffer containing the `ec_frame_t` and the length of the frame
+     * 
+     * @warning The caller is responsible for freeing the memory returned by this function
+     */
+    std::pair<uint8_t *, uint16_t> create_recfg_auth_cnf();
+
+    /**
+     * @brief Create a presence announcement frame in a pre-allocated buffer
+     * 
+     * @param buff The buffer to store the frame
+     * @return int The length of the frame
+     */
+    std::pair<uint8_t *, uint16_t> create_pres_ann();
 
     /**
      * @brief Handle a chirp notification msg tlv and send the next message
@@ -143,30 +278,6 @@ public:
      */
     int handle_proxy_encap_dpp_msg(em_encap_dpp_t *encap_tlv, uint16_t encap_tlv_len, em_dpp_chirp_value_t *chirp_tlv, uint16_t chirp_tlv_len);
     
-    /**
-     * @brief Create an authentication response frame in a pre-allocated buffer
-     * 
-     * @param buff The buffer to store the frame
-     * @return int The length of the frame
-     */
-    int create_auth_rsp(uint8_t *buff);
-    
-    /**
-     * @brief Create an authentication confirmation frame in a pre-allocated buffer
-     * 
-     * @param buff The buffer to store the frame
-     * @return int The length of the frame
-     */
-    int create_auth_cnf(uint8_t *buff);
-
-    /**
-     * @brief Create a presence announcement frame in a pre-allocated buffer
-     * 
-     * @param buff The buffer to store the frame
-     * @return int The length of the frame
-     */
-    int create_pres_ann(uint8_t *buff);
-
     /**
      * @brief Handles DPP action frames directed at this nodes ec_session
      * 

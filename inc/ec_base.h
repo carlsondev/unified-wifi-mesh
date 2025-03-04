@@ -200,7 +200,10 @@ typedef struct {
     const EC_GROUP *group;
     const EVP_MD *hashfcn;
     BIGNUM *x, *y, *prime;
+
+    // X coordinate of points needed for repeated calculations
     BIGNUM *m, *n, *l;
+
     EC_POINT *M, *N;
     BN_CTX *bnctx;
     EC_KEY *initiator_proto_key;
